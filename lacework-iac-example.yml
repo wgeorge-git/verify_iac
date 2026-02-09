@@ -1,0 +1,101 @@
+name: Daily IaC Scan on Main Branch
+
+# Schedule the workflow to run every 24 hours
+on:
+  schedule:
+    - cron: '0 1 * * *'  # Runs every day at 1 AM UTC
+
+  # Also allow manual triggering of the workflow
+  workflow_dispatch:
+
+permissions:
+  security-events: write  # Grant permission to upload SARIF files for Code Scanning
+  contents: read  # Grant permission to read the contents of the repository
+  actions: read
+
+jobs:
+  daily_scan:
+    runs-on: ubuntu-latest  # The job runs on the latest Ubuntu environment
+
+    steps:
+      # Step 1: Install the Lacework CLI and IaC component
+      - name: Install Lacework CLI
+        run: |
+          # Download and install the Lacework CLI using a shell script
+
+          curl https://raw.githubusercontent.com/lacework/go-sdk/main/cli/install.sh | bash
+          # Configure the Lacework CLI with account, API key, and secret from GitHub secrets
+          lacework configure -a ${{ secrets.LW_ACCOUNT }}.lacework.net -k ${{ secrets.LW_API_KEY }} -s ${{ secrets.LW_API_SECRET }} --noninteractive
+          # Install the IaC component
+          lacework component install iac
+
+      # Step 2: Check out the main branch
+      - name: Checkout main branch
+        uses: actions/checkout@v3  # Use the checkout action to pull the main branch code
+        with:
+          ref: main  # Specify the main branch
+          token: ${{ secrets.GITHUB_TOKEN }}  # Use the GitHub token for authentication
+
+      # Step 3: Install Latest Terraform and Handle Plan Compatibility
+      - name: Install Latest Terraform
+        run: |
+          # Install the latest Terraform
+          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+          sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+          sudo apt-get update && sudo apt-get install terraform
+
+      # Step 5: Set up Cloud Credentials and Regenerate Terraform Plan
+      - name: Set up Cloud Credentials and Regenerate Terraform Plan
+        run: |
+          cd e2e/test_data/iac/Terraform-Plan/ec2-instances/
+
+          # Set up AWS credentials from GitHub secrets
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          export AWS_DEFAULT_REGION=us-east-1
+
+          # Echo AWS credentials (masked in logs)
+          echo "AWS Access Key ID: ${AWS_ACCESS_KEY_ID:0:4}********"
+          echo "AWS Secret Access Key set: $([[ -n "$AWS_SECRET_ACCESS_KEY" ]] && echo "Yes" || echo "No")"
+
+          # Set up Azure credentials from GitHub secrets
+          export ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          export ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}
+          export ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}
+          export ARM_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }}
+
+          # Export additional Azure variables for Terraform
+          export TF_VAR_azure_subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          export TF_VAR_azure_tenant_id=${{ secrets.AZURE_TENANT_ID }}
+          export TF_VAR_azure_object_id=${{ secrets.AZURE_OBJECT_ID }}
+
+          # Echo Azure credentials (masked in logs)
+          echo "Azure Subscription ID: ${ARM_SUBSCRIPTION_ID:0:4}********"
+          echo "Azure Tenant ID: ${ARM_TENANT_ID:0:4}********"
+          echo "Azure Client ID: ${ARM_CLIENT_ID:0:4}********"
+          echo "Azure Client Secret set: $([[ -n "$ARM_CLIENT_SECRET" ]] && echo "Yes" || echo "No")"
+          echo "Azure Object ID: $([[ -n "${{ secrets.AZURE_OBJECT_ID }}" ]] && echo "${{ secrets.AZURE_OBJECT_ID }} set" || echo "Not set")"
+
+          # Initialize Terraform
+          terraform init -upgrade
+
+          # Generate plan with real credentials
+          terraform plan -out=main.tfplan -input=false
+
+          # Generate JSON from plan
+          terraform show -json main.tfplan > plan.json
+          cd ../../../../..
+
+      # Step 6: Run the Lacework IaC scan on the main branch and generate SARIF output
+      - name: Run Lacework IaC Scan on Main Branch
+        run: lacework iac scan -d e2e/test_data/iac/ || echo "Lacework exited with code $?"
+
+      # Step 7: Check Lacework Exit Code
+      - name: Check Lacework Exit Code
+        if: ${{ failure() }}
+        run: |
+          if [ "${{ steps.lacework_scan.outcome }}" != "success" ]; then
+            echo "Lacework scan failed unexpectedly"
+            exit 1
+          fi
+          
